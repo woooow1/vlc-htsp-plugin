@@ -386,39 +386,54 @@ bool SubscribeHTSP(demux_t *demux)
 
 bool parseURL(demux_t *demux)
 {
-    demux_sys_t *sys = demux->p_sys;
-    char path[1024];
-    snprintf(path, sizeof(path), "%s://%s", demux->psz_access, demux->psz_location);
-
-    if(path == 0 || *path == 0)
+    if (!demux || !demux->psz_access || !demux->psz_location)
         return false;
 
-    vlc_url_t *url = &(sys->url);
+    demux_sys_t *sys = demux->p_sys;
+    if (!sys)
+        return false;
+
+    // Construct URL string
+    char path[1024];
+    int n = snprintf(path, sizeof(path), "%s://%s", demux->psz_access, demux->psz_location);
+    if(n < 0 || n >= (int)sizeof(path))
+        return false;
+
+    if (*path == '\0') // check only for empty string
+        return false;
+
+    vlc_url_t *url = &sys->url;
+
 #if CHECK_VLC_VERSION(3, 0)
     vlc_UrlParse(url, path);
 #else
     vlc_UrlParse(url, path, 0);
 #endif
 
-    if(url->psz_host == 0 || *url->psz_host == 0)
+    if (!url->psz_host || *url->psz_host == '\0')
         return false;
-    else
-        sys->host = url->psz_host;
+    sys->host = url->psz_host;
 
-    if(url->i_port <= 0)
-        sys->port = 9982;
-    else
-        sys->port = url->i_port;
+    sys->port = (url->i_port <= 0) ? 9982 : url->i_port;
 
-    if(url->psz_username)
+    if (url->psz_username)
         sys->username = url->psz_username;
-    if(url->psz_password)
+    if (url->psz_password)
         sys->password = url->psz_password;
 
-    if(url->psz_path == 0 || *(url->psz_path) == '\0' || *(url->psz_path + 1) == '\0')
+    // Parse channelId
+    if (!url->psz_path || url->psz_path[0] == '\0' || url->psz_path[1] == '\0')
+    {
         sys->channelId = 0;
+    }
     else
-        sys->channelId = atoi(url->psz_path + 1); // Remove leading '/'
+    {
+        try {
+            sys->channelId = std::stoi(url->psz_path + 1); // remove leading '/'
+        } catch (...) {
+            sys->channelId = 0;
+        }
+    }
 
     return true;
 }
@@ -800,6 +815,10 @@ bool ParseSubscriptionStart(demux_t *demux, HtsMessage &msg)
         else if(type == "H264")
         {
             es_format_Init(fmt, VIDEO_ES, VLC_CODEC_H264);
+        }
+        else if(type == "HEVC")
+        {
+            es_format_Init(fmt, VIDEO_ES, VLC_CODEC_HEVC);
         }
         else if(type == "DVBSUB")
         {
