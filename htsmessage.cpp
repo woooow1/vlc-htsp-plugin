@@ -439,29 +439,23 @@ bool HtsMessage::Serialize(uint32_t *length, void **buf)
     auto umap = map->getRawData();
     for (auto it = umap.begin(); it != umap.end(); ++it)
         resLength += it->second->calcSize();
-
-    // 🧩 Поправка 1: заделяме +4 байта за HTSP дължината
+    
     resBuf = (unsigned char*)malloc(resLength + 4);
     if (!resBuf)
         return false;
 
-    // Не е нужно memset, но ако държиш да инициализираш:
     memset(resBuf, 0xFF, resLength + 4);
-
-    // 🧩 Поправка 2: записваме дължината в първите 4 байта
+    
     *((uint32_t*)resBuf) = htonl(resLength);
 
-    // 🧩 Поправка 3: данните започват след тези 4 байта
     char *tmpbuf = (char*)resBuf + 4;
 
-    // Сериализираме съдържанието
     for (auto it = umap.begin(); it != umap.end(); ++it)
     {
         it->second->Serialize(tmpbuf);
         tmpbuf += it->second->calcSize();
     }
 
-    // Връщаме коректната дължина и буфер
     *length = resLength + 4;
     *buf = resBuf;
 
