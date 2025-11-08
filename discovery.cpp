@@ -21,6 +21,10 @@
 #include <functional>
 #include <unordered_map>
 #include <sstream>
+#include <fstream>
+#include <list>
+#include <vector>
+#include <algorithm>
 
 #include "discovery.h"
 #include "helper.h"
@@ -39,7 +43,6 @@ struct tmp_channel
     uint32_t cnum;
     std::string url;
     std::string cicon;
-    input_item_t *item;
     std::list<std::string> tags;
 };
 
@@ -56,10 +59,92 @@ struct services_discovery_sys_t : public sys_common_t
 
     vlc_thread_t thread;
     std::unordered_map<uint32_t, tmp_channel> channelMap;
-	bool disconnect;
+    bool disconnect;
 };
 
-bool ConnectSD(services_discovery_t *sd)
+/* ------------------------------------------------------------------------- */
+
+static void ExportM3U(const std::unordered_map<uint32_t, tmp_channel>& channels,
+                      const std::string &filepath,
+                      vlc_object_t *obj)
+{
+    std::ofstream m3uFile(filepath);
+    if (!m3uFile.is_open())
+        return;
+
+    m3uFile << "#EXTM3U\n";
+
+    std::vector<tmp_channel> sortedChannels;
+    for (auto &pair : channels)
+        sortedChannels.push_back(pair.second);
+
+    std::sort(sortedChannels.begin(), sortedChannels.end(),
+              [](const tmp_channel &a, const tmp_channel &b) { return a.cnum < b.cnum; });
+
+    for (const auto &ch : sortedChannels)
+    {
+        m3uFile << "#EXTINF:-1";
+        if (!ch.name.empty())
+        {
+            m3uFile << " tvg-id=\"" << ch.cid << "\"";
+            m3uFile << " tvg-name=\"" << ch.name << "\"";
+            if (!ch.cicon.empty())
+                m3uFile << " tvg-logo=\"" << ch.cicon << "\"";
+        }
+        m3uFile << "," << ch.cnum << " - " << ch.name << "\n";
+        m3uFile << ch.url << "\n";
+    }
+
+    m3uFile.close();
+    msg_Info(obj, "HTSP DEBUG: exported M3U with %zu channels", channels.size());
+}
+
+/* ------------------------------------------------------------------------- */
+
+static void AddChannel(const tmp_channel &ch, services_discovery_sys_t *sys)
+{
+    sys->channelMap[ch.cid] = ch;
+}
+
+/* ------------------------------------------------------------------------- */
+
+static void AddChannelsToVLC(services_discovery_t *sd, services_discovery_sys_t *sys)
+{
+    msg_Info(sd, "HTSP DEBUG: adding channels to VLC playlist...");
+
+    std::vector<tmp_channel> sortedChannels;
+    for (auto &pair : sys->channelMap)
+        sortedChannels.push_back(pair.second);
+
+    std::sort(sortedChannels.begin(), sortedChannels.end(),
+        [](const tmp_channel &a, const tmp_channel &b) { return a.cnum < b.cnum; });
+
+    for (auto &ch : sortedChannels)
+    {
+        std::ostringstream displayName;
+        displayName << ch.cnum << " - " << ch.name;
+
+        input_item_t *item = input_item_New(ch.url.c_str(), displayName.str().c_str());
+        if (!item)
+        {
+            msg_Err(sd, "HTSP DEBUG: failed to create input_item for channel %s", ch.name.c_str());
+            continue;
+        }
+
+        if (!ch.cicon.empty())
+            input_item_SetArtURL(item, ch.cicon.c_str());
+
+        // Добавяне към VLC SD
+        services_discovery_AddItem(sd, item);
+        input_item_Release(item);
+
+        msg_Info(sd, "HTSP DEBUG: added channel '%s' (%u) to VLC", ch.name.c_str(), ch.cid);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+
+static bool ConnectSD(services_discovery_t *sd)
 {
     services_discovery_sys_t *sys = sd->p_sys;
 
@@ -67,66 +152,49 @@ bool ConnectSD(services_discovery_t *sd)
     int port = var_GetInteger(sd, CFG_PREFIX"port");
     sys->disconnect = var_GetBool(sd, CFG_PREFIX"disconnect");
 
-    if(port == 0)
+    if (port == 0)
         port = 9982;
 
-    if(host == 0 || host[0] == 0)
+    msg_Info(sd, "HTSP DEBUG: connecting to %s:%d", host && host[0] ? host : "localhost", port);
+
+    if (host == nullptr || host[0] == 0)
         sys->netfd = net_ConnectTCP(sd, "localhost", port);
     else
         sys->netfd = net_ConnectTCP(sd, host, port);
 
-    if(host)
-        free(host);
-
-    if(sys->netfd < 0)
+    if (host) free(host);
+    if (sys->netfd < 0)
     {
-        msg_Err(sd, "net_ConnectTCP failed");
+        msg_Err(sd, "HTSP DEBUG: net_ConnectTCP failed");
         return false;
     }
 
+    // Hello
     HtsMap map;
     map.setData("method", "hello");
     map.setData("clientname", "VLC media player");
     map.setData("htspversion", HTSP_PROTO_VERSION);
 
     HtsMessage m = ReadResult(sd, sys, map.makeMsg());
-    if(!m.isValid())
+    if (!m.isValid())
     {
-        msg_Err(sd, "No valid hello response");
+        msg_Err(sd, "HTSP DEBUG: failed to receive hello response");
         return false;
     }
 
     uint32_t chall_len;
-    void * chall;
+    void *chall;
     m.getRoot()->getBin("challenge", &chall_len, &chall);
-
-    std::string serverName = m.getRoot()->getStr("servername");
-    std::string serverVersion = m.getRoot()->getStr("serverversion");
-    uint32_t protoVersion = m.getRoot()->getU32("htspversion");
-
-    msg_Info(sd, "Connected to HTSP Server %s, version %s, protocol %d", serverName.c_str(), serverVersion.c_str(), protoVersion);
-    if(protoVersion < HTSP_PROTO_VERSION)
-    {
-        msg_Warn(sd, "TVHeadend is running an older version of HTSP(v%d) than we are(v%d). No effort was made to keep compatible with older versions, update tvh before reporting problems!", protoVersion, HTSP_PROTO_VERSION);
-    }
-    else if(protoVersion > HTSP_PROTO_VERSION)
-    {
-        msg_Info(sd, "TVHeadend is running a more recent version of HTSP(v%d) than we are(v%d). Check if there is an update available!", protoVersion, HTSP_PROTO_VERSION);
-    }
 
     char *user = var_GetString(sd, CFG_PREFIX"user");
     char *pass = var_GetString(sd, CFG_PREFIX"pass");
-    if(user == 0 || user[0] == 0)
-        return true;
 
     map = HtsMap();
     map.setData("method", "authenticate");
-    map.setData("username", user);
+    map.setData("username", user ? user : "");
 
-    if(pass != 0 && pass[0] != 0 && chall)
+    if (pass && pass[0] && chall)
     {
-        msg_Info(sd, "Authenticating as '%s' with a password", user);
-
         HTSSHA1 *shactx = (HTSSHA1*)malloc(hts_sha1_size);
         uint8_t d[20];
         hts_sha1_init(shactx);
@@ -140,62 +208,44 @@ bool ConnectSD(services_discovery_t *sd)
 
         free(shactx);
     }
-    else
-        msg_Info(sd, "Authenticating as '%s' without a password", user);
 
-    if(user)
-        free(user);
-    if(pass)
-        free(pass);
-    if(chall)
-        free(chall);
+    if (user) free(user);
+    if (pass) free(pass);
+    if (chall) free(chall);
 
-    bool res = ReadSuccess(sd, sys, map.makeMsg(), "authenticate");
-    if(res)
-        msg_Info(sd, "Successfully authenticated!");
+    bool ok = ReadSuccess(sd, sys, map.makeMsg(), "authenticate");
+    if (ok)
+        msg_Info(sd, "HTSP DEBUG: authentication successful");
     else
-        msg_Err(sd, "Authentication failed!");
-    return res;
+        msg_Err(sd, "HTSP DEBUG: authentication failed");
+
+    return ok;
 }
 
-bool GetChannels(services_discovery_t *sd)
+/* ------------------------------------------------------------------------- */
+
+static bool GetChannels(services_discovery_t *sd)
 {
     services_discovery_sys_t *sys = sd->p_sys;
+    msg_Info(sd, "HTSP DEBUG: requesting channel list...");
 
     HtsMap map;
     map.setData("method", "enableAsyncMetadata");
-    if(!ReadSuccess(sd, sys, map.makeMsg(), "enable async metadata"))
+    if (!ReadSuccess(sd, sys, map.makeMsg(), "enable async metadata"))
         return false;
 
-    std::list<uint32_t> channelIds;
-    std::unordered_map<uint32_t, tmp_channel> channels;
-
     HtsMessage m;
-    while((m = ReadMessage(sd, sys)).isValid())
+    while ((m = ReadMessage(sd, sys)).isValid())
     {
         std::string method = m.getRoot()->getStr("method");
-        if(method.empty() || method == "initialSyncCompleted")
-        {
-            msg_Info(sd, "Finished getting initial metadata sync");
+        if (method.empty() || method == "initialSyncCompleted")
             break;
-        }
 
-        if(method == "channelAdd")
+        if (method == "channelAdd")
         {
-            if(!m.getRoot()->contains("channelId"))
-                continue;
             uint32_t cid = m.getRoot()->getU32("channelId");
-
             std::string cname = m.getRoot()->getStr("channelName");
-            if(cname.empty())
-            {
-                std::ostringstream ss;
-                ss << "Channel " << cid;
-                cname = ss.str();
-            }
-
             uint32_t cnum = m.getRoot()->getU32("channelNumber");
-
             std::string cicon = m.getRoot()->getStr("channelIcon");
 
             std::ostringstream oss;
@@ -203,154 +253,102 @@ bool GetChannels(services_discovery_t *sd)
 
             char *user = var_GetString(sd, CFG_PREFIX"user");
             char *pass = var_GetString(sd, CFG_PREFIX"pass");
-            if(user != 0 && user[0] != 0 && pass != 0 && pass[0] != 0)
+            if (user && user[0] && pass && pass[0])
                 oss << user << ":" << pass << "@";
-            else if(user != 0 && user[0] != 0)
+            else if (user && user[0])
                 oss << user << "@";
 
             char *_host = var_GetString(sd, CFG_PREFIX"host");
-            const char *host = _host;
-            if(host == 0 || host[0] == 0)
-                host = "localhost";
+            const char *host = (_host && _host[0]) ? _host : "localhost";
             int port = var_GetInteger(sd, CFG_PREFIX"port");
-            if(port == 0)
-                port = 9982;
+            if (port == 0) port = 9982;
             oss << host << ":" << port << "/" << cid;
 
-            channels[cid].name = cname;
-            channels[cid].cid = cid;
-            channels[cid].cnum = cnum;
-            channels[cid].cicon = cicon;
-            channels[cid].url = oss.str();
+            tmp_channel ch = { cname, cid, cnum, oss.str(), cicon, {} };
+            AddChannel(ch, sys);
 
-            channelIds.push_back(cid);
-            
-            if(user)
-                free(user);
-            if(pass)
-                free(pass);
-            if(_host)
-                free(_host);
-        }
-        else if(method == "tagAdd" || method == "tagUpdate")
-        {
-            if(!m.getRoot()->contains("tagId") || !m.getRoot()->contains("tagName"))
-                continue;
+            msg_Info(sd, "HTSP DEBUG: channel #%u '%s' added", cid, cname.c_str());
 
-            std::string tagName = m.getRoot()->getStr("tagName");
-
-            std::shared_ptr<HtsList> chList = m.getRoot()->getList("members");
-            for(uint32_t i = 0; i < chList->count(); ++i)
-                channels[chList->getData(i)->getU32()].tags.push_back(tagName);
+            if (user) free(user);
+            if (pass) free(pass);
+            if (_host) free(_host);
         }
     }
 
-    channelIds.sort([&](const uint32_t &first, const uint32_t &second) {
-        return channels[first].cnum < channels[second].cnum;
-    });
+    ExportM3U(sys->channelMap, "/tmp/tvh_channels.m3u", (vlc_object_t*)sd);
+    AddChannelsToVLC(sd, sys);
 
-    while(channelIds.size() > 0)
-    {
-        tmp_channel ch = channels[channelIds.front()];
-        channelIds.pop_front();
-
-        ch.item = input_item_New(ch.url.c_str(), ch.name.c_str());
-        if(unlikely(ch.item == 0))
-            return false;
-
-        input_item_SetArtworkURL(ch.item, ch.cicon.c_str());
-
-#if CHECK_VLC_VERSION(3, 0)
-        ch.item->i_type = ITEM_TYPE_STREAM;
-#else
-        ch.item->i_type = ITEM_TYPE_NET;
-#endif
-        for(std::string tag: ch.tags)
-#if CHECK_VLC_VERSION(3, 0)
-            services_discovery_AddItemCat(sd, ch.item, tag.c_str());
-#else
-            services_discovery_AddItem(sd, ch.item, tag.c_str());
-#endif
-
-#if CHECK_VLC_VERSION(3, 0)
-        services_discovery_AddItemCat(sd, ch.item, "All Channels");
-#else
-        services_discovery_AddItem(sd, ch.item, "All Channels");
-#endif
-
-
-        sys->channelMap[ch.cid] = ch;
-    }
-
+    msg_Info(sd, "HTSP DEBUG: total channels loaded: %zu", sys->channelMap.size());
     return true;
 }
 
-void * RunSD(void *obj)
+/* ------------------------------------------------------------------------- */
+
+static void *RunSD(void *obj)
 {
     services_discovery_t *sd = (services_discovery_t *)obj;
     services_discovery_sys_t *sys = sd->p_sys;
 
-    if(!ConnectSD(sd))
-    {
-        msg_Err(sd, "Connecting to HTS Failed!");
-        return 0;
-    }
+    msg_Info(sd, "HTSP DEBUG: discovery thread started");
 
-    GetChannels(sd);
+    if (!ConnectSD(sd))
+        return nullptr;
 
-    while(!sys->disconnect)
+    if (!GetChannels(sd))
+        msg_Err(sd, "HTSP DEBUG: failed to get channels");
+
+    while (!sys->disconnect)
     {
         HtsMessage msg = ReadMessage(sd, sys);
-        if(!msg.isValid())
+        if (!msg.isValid())
             break;
-
-        std::string method = msg.getRoot()->getStr("method");
-        if(method.empty())
-            break;
-
-        msg_Dbg(sd, "Got Message with method %s", method.c_str());
     }
 
     net_Close(sys->netfd);
-
-    return 0;
+    msg_Info(sd, "HTSP DEBUG: discovery thread finished");
+    return nullptr;
 }
+
+/* ------------------------------------------------------------------------- */
 
 int OpenSD(vlc_object_t *obj)
 {
     services_discovery_t *sd = (services_discovery_t *)obj;
     services_discovery_sys_t *sys = new services_discovery_sys_t;
-    if(unlikely(sys == NULL))
+    if (!sys)
         return VLC_ENOMEM;
+
     sd->p_sys = sys;
 
     config_ChainParse(sd, CFG_PREFIX, cfg_options, sd->p_cfg);
 
-    if(vlc_clone(&sys->thread, RunSD, sd, VLC_THREAD_PRIORITY_LOW))
+    if (vlc_clone(&sys->thread, RunSD, sd, VLC_THREAD_PRIORITY_LOW))
     {
         delete sys;
         return VLC_EGENERIC;
     }
 
+    msg_Info(sd, "HTSP DEBUG: OpenSD successful");
     return VLC_SUCCESS;
 }
+
+/* ------------------------------------------------------------------------- */
 
 void CloseSD(vlc_object_t *obj)
 {
     services_discovery_t *sd = (services_discovery_t *)obj;
     services_discovery_sys_t *sys = sd->p_sys;
-
-    if(!sys)
+    if (!sys)
         return;
 
 #if CHECK_VLC_VERSION(3, 0)
-    if(sys->thread.handle)
+    if (sys->thread.handle)
 #else
-    if(sys->thread)
+    if (sys->thread)
 #endif
     {
         vlc_cancel(sys->thread);
-        vlc_join(sys->thread, 0);
+        vlc_join(sys->thread, nullptr);
 #if CHECK_VLC_VERSION(3, 0)
         sys->thread.handle = 0;
 #else
@@ -359,5 +357,6 @@ void CloseSD(vlc_object_t *obj)
     }
 
     delete sys;
-    sys = sd->p_sys = 0;
+    sd->p_sys = nullptr;
+    msg_Info(sd, "HTSP DEBUG: CloseSD finished");
 }
